@@ -1,0 +1,153 @@
+name: Build & release Juicebox server
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-ui:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      - name: Version
+        id: version
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install bun
+        run: npm install --global bun@1.2.20
+
+      - name: Build frontend (Astro)
+        working-directory: juicefront/ui
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Bundle server entry (self-contained, no node_modules)
+        working-directory: juicefront/ui
+        run: |
+          bun build dist/server/entry.mjs --outfile dist/server/entry.bundle.mjs --format=esm --target=node
+
+      - name: Package UI tarball
+        run: |
+          tar -czf juicefront-ui-${{ steps.version.outputs.version }}.tar.gz -C juicefront/ui dist server.mjs
+          sha256sum juicefront-ui-${{ steps.version.outputs.version }}.tar.gz \
+            > juicefront-ui-${{ steps.version.outputs.version }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui
+          path: juicefront-ui-*.tar.gz*
+
+  build-linux:
+    needs: build-ui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+
+      # Pinning blocker: verify dtolnay/rust-toolchain's immutable commit before replacing this tag.
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Pinning blocker: verify Swatinem/rust-cache's immutable commit before replacing this tag.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build binaries
+        run: cargo build --release --workspace
+
+      - name: Fetch and build JuiceFetch (standalone repo)
+        env:
+          JUICEFETCH_COMMIT: ${{ vars.JUICEFETCH_COMMIT }}
+        run: |
+          test "${#JUICEFETCH_COMMIT}" -eq 40
+          case "$JUICEFETCH_COMMIT" in *[!0-9a-f]*) exit 1;; esac
+          git init /tmp/JuiceFetch
+          git -C /tmp/JuiceFetch remote add origin https://github.com/juiceboxdev/JuiceFetch.git
+          git -C /tmp/JuiceFetch fetch --depth 1 origin "$JUICEFETCH_COMMIT"
+          git -C /tmp/JuiceFetch checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/JuiceFetch rev-parse HEAD)" = "$JUICEFETCH_COMMIT"
+          cargo build --release --manifest-path /tmp/JuiceFetch/Cargo.toml
+          cp /tmp/JuiceFetch/target/release/juicefetch target/release/juicefetch
+
+      - name: Package binary tarballs
+        run: |
+          VERSION=${{ needs.build-ui.outputs.version }}
+          for name in juicebox juiceback juicehost juicefront juicefetch; do
+            tar -czf ${name}-${VERSION}-linux-${{ matrix.arch }}.tar.gz -C target/release ${name}
+            sha256sum ${name}-${VERSION}-linux-${{ matrix.arch }}.tar.gz \
+              > ${name}-${VERSION}-linux-${{ matrix.arch }}.tar.gz.sha256
+          done
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: '*linux-${{ matrix.arch }}.tar.gz*'
+
+  release:
+    needs: [build-ui, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: artifacts
+
+      - name: Create and sign release provenance
+        env:
+          PROVENANCE_SIGNING_KEY: ${{ secrets.PROVENANCE_SIGNING_KEY }}
+          RELEASE_TAG: v${{ needs.build-ui.outputs.version }}
+        run: |
+          test -n "$PROVENANCE_SIGNING_KEY"
+          find artifacts -type f -name '*.tar.gz' -print0 | sort -z | \
+            xargs -0 sha256sum | jq -Rn --arg tag "$RELEASE_TAG" \
+            '[inputs | capture("^(?<sha>[0-9a-f]{64})  (?<path>.*)$") | {key: (.path | split("/") | last), value: .sha}] | {tag: $tag, assets: from_entries}' \
+            > artifacts/juicebox-provenance.json
+          printf '%s' "$PROVENANCE_SIGNING_KEY" | base64 --decode > "$RUNNER_TEMP/provenance-key.pem"
+          chmod 600 "$RUNNER_TEMP/provenance-key.pem"
+          openssl pkeyutl -sign -rawin -inkey "$RUNNER_TEMP/provenance-key.pem" \
+            -in artifacts/juicebox-provenance.json -out "$RUNNER_TEMP/provenance.sig"
+          base64 --wrap=0 "$RUNNER_TEMP/provenance.sig" > artifacts/juicebox-provenance.json.sig
+          rm -f "$RUNNER_TEMP/provenance-key.pem" "$RUNNER_TEMP/provenance.sig"
+
+      - name: Create GitHub Release
+        # Pinning blocker: verify softprops/action-gh-release's immutable commit before replacing this tag.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.build-ui.outputs.version }}
+          generate_release_notes: true
+          files: |
+            artifacts/*/*
+            artifacts/juicebox-provenance.json
+            artifacts/juicebox-provenance.json.sig

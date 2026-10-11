@@ -1,0 +1,33 @@
+/target/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+delta.db
+delta.db-shm
+delta.db-wal
+quic-cert.der
+quic-cert.key
+
+# Runtime state
+files/
